@@ -1,5 +1,6 @@
 import io
 import json
+import threading
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -55,6 +56,32 @@ class MockVectorStoreFiles:
         return SimpleNamespace(id=file_id, deleted=True)
 
 
+class MockFileBatches:
+    def __init__(self, events, batch_status="completed", batch_statuses=None):
+        self.events = events
+        self.batch_status = batch_status
+        self.batch_statuses = list(batch_statuses or [])
+        self.attached = []
+
+    def create_and_poll(self, *, vector_store_id, file_ids, chunking_strategy):
+        file_ids = list(file_ids)
+        self.events.append(("batch_attach", tuple(file_ids)))
+        self.attached.append((vector_store_id, file_ids, chunking_strategy))
+        status = self.batch_statuses.pop(0) if self.batch_statuses else self.batch_status
+        failed = 0 if status == "completed" else len(file_ids)
+        completed = len(file_ids) if status == "completed" else 0
+        return SimpleNamespace(
+            id="batch_mock",
+            status=status,
+            file_counts=SimpleNamespace(
+                total=len(file_ids),
+                completed=completed,
+                failed=failed,
+                cancelled=0,
+            ),
+        )
+
+
 class MockVectorStores:
     def __init__(
         self,
@@ -69,6 +96,11 @@ class MockVectorStores:
             attach_statuses=attach_statuses,
             delete_fail_ids=delete_fail_ids,
         )
+        self.file_batches = MockFileBatches(
+            events,
+            batch_status=attach_status,
+            batch_statuses=attach_statuses,
+        )
         self.created = []
 
     def create(self, **kwargs):
@@ -81,11 +113,15 @@ class MockFiles:
         self.events = events
         self.created = []
         self.deleted = []
+        self.next_id = 1
+        self.lock = threading.Lock()
 
     def create(self, *, file, purpose):
-        file_id = f"file_{len(self.created) + 1}"
-        self.events.append(("file_create", file_id))
-        self.created.append((file.name, purpose, file_id))
+        with self.lock:
+            file_id = f"file_{self.next_id}"
+            self.next_id += 1
+            self.events.append(("file_create", file_id))
+            self.created.append((file.name, purpose, file_id))
         return SimpleNamespace(id=file_id)
 
     def delete(self, file_id):
@@ -205,9 +241,9 @@ class SyncJobTests(unittest.TestCase):
             self.assertEqual(client.vector_stores.files.deleted, [("vs_existing", "file_old")])
             self.assertEqual(client.files.deleted, ["file_old"])
             self.assertEqual(len(client.files.created), 1)
-            self.assertEqual(len(client.vector_stores.files.attached), 1)
+            self.assertEqual(len(client.vector_stores.file_batches.attached), 1)
             self.assertLess(
-                client.events.index(("attach", "file_1")),
+                client.events.index(("batch_attach", ("file_1",))),
                 client.events.index(("vector_delete", "file_old")),
             )
 
@@ -254,7 +290,7 @@ class SyncJobTests(unittest.TestCase):
                 return_value=FetchResult([article], skipped_count=0),
             ):
                 with redirect_stdout(io.StringIO()):
-                    with self.assertRaisesRegex(RuntimeError, "indexing failed"):
+                    with self.assertRaisesRegex(RuntimeError, "batch indexing failed"):
                         run_sync(
                             articles_dir=root / "articles",
                             chunks_dir=root / "chunks",
@@ -266,7 +302,7 @@ class SyncJobTests(unittest.TestCase):
             self.assertEqual(client.files.deleted, ["file_1"])
             self.assertNotIn(("vector_delete", "file_old"), client.events)
 
-    def test_run_sync_rolls_back_prior_chunks_when_later_chunk_fails(self):
+    def test_run_sync_rolls_back_uploaded_chunks_when_batch_indexing_fails(self):
         article = Article(
             article_id=1,
             title="Article",
@@ -294,14 +330,14 @@ class SyncJobTests(unittest.TestCase):
                     },
                 },
             )
-            client = MockOpenAIClient(attach_statuses=["completed", "failed"])
+            client = MockOpenAIClient(attach_status="failed")
 
             with patch(
                 "optibot_scraper.sync_job.fetch_articles",
                 return_value=FetchResult([article], skipped_count=0),
             ):
                 with redirect_stdout(io.StringIO()):
-                    with self.assertRaisesRegex(RuntimeError, "indexing failed"):
+                    with self.assertRaisesRegex(RuntimeError, "batch indexing failed"):
                         run_sync(
                             articles_dir=root / "articles",
                             chunks_dir=root / "chunks",
@@ -311,10 +347,19 @@ class SyncJobTests(unittest.TestCase):
                             client=client,
                         )
 
-            self.assertIn(("vector_delete", "file_1"), client.events)
-            self.assertIn(("file_delete", "file_1"), client.events)
-            self.assertIn(("vector_delete", "file_2"), client.events)
-            self.assertIn(("file_delete", "file_2"), client.events)
+            created_file_ids = {
+                file_id
+                for _, _, file_id in client.files.created
+            }
+            self.assertGreaterEqual(len(created_file_ids), 2)
+            self.assertEqual(set(client.files.deleted), created_file_ids)
+            batch_events = [
+                event
+                for event in client.events
+                if event[0] == "batch_attach"
+            ]
+            self.assertEqual(len(batch_events), 1)
+            self.assertEqual(set(batch_events[0][1]), created_file_ids)
             self.assertNotIn(("vector_delete", "file_old"), client.events)
             self.assertEqual(
                 json.loads(state_path.read_text(encoding="utf-8"))["articles"]["1"][

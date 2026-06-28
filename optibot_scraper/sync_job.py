@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -33,6 +34,7 @@ from optibot_scraper.sync_storage import LocalSyncStore, SpacesSyncStore, sync_s
 
 DEFAULT_STATE_PATH = Path("data/job_state/sync_state.json")
 DEFAULT_RUNS_DIR = Path("data/job_runs")
+DEFAULT_UPLOAD_CONCURRENCY = 5
 
 
 @dataclass(frozen=True)
@@ -177,57 +179,94 @@ def delete_uploaded_file(client: OpenAI, vector_store_id: str, file_id: str) -> 
     return deleted_cleanly
 
 
-def ensure_vector_store_file_completed(vector_store_file: Any, file_id: str) -> None:
-    status = getattr(vector_store_file, "status", None)
-    if status != "completed":
+def ensure_file_batch_completed(file_batch: Any, file_ids: list[str]) -> None:
+    status = getattr(file_batch, "status", None)
+    file_counts = getattr(file_batch, "file_counts", None)
+    failed = file_count_value(file_counts, "failed")
+    cancelled = file_count_value(file_counts, "cancelled")
+    if status != "completed" or failed or cancelled:
         raise RuntimeError(
-            f"OpenAI vector-store indexing failed for file {file_id}: status={status}"
+            "OpenAI vector-store batch indexing failed: "
+            f"status={status}, completed={file_count_value(file_counts, 'completed')}, "
+            f"failed={failed}, cancelled={cancelled}, total={file_count_value(file_counts, 'total')}, "
+            f"file_ids={file_ids}"
         )
 
 
-def upload_article_chunks(
+def file_count_value(file_counts: Any, field: str) -> int:
+    if file_counts is None:
+        return 0
+    if isinstance(file_counts, dict):
+        return int(file_counts.get(field) or 0)
+    return int(getattr(file_counts, field, 0) or 0)
+
+
+def upload_chunk_file(client: OpenAI, chunk_path: Path) -> str:
+    with chunk_path.open("rb") as stream:
+        file_obj = client.files.create(file=stream, purpose="assistants")
+    return file_obj.id
+
+
+def upload_article_chunks_batch(
     client: OpenAI,
     vector_store_id: str,
-    article_state: dict[str, Any],
+    article_states: list[dict[str, Any]],
     chunk_size: int,
     chunk_overlap: int,
-    article_index: int | None = None,
-    article_total: int | None = None,
+    max_concurrency: int,
 ) -> list[str]:
-    file_ids = []
-    strategy = chunking_strategy(chunk_size, chunk_overlap)
-    chunks = article_state.get("chunks", [])
-    article_label = article_state.get("source_file") or article_state.get("article_id")
-    prefix = ""
-    if article_index is not None and article_total is not None:
-        prefix = f"[{article_index}/{article_total}] "
+    upload_items: list[tuple[str, int, Path]] = []
+    for article_state in article_states:
+        article_id = article_state["article_id"]
+        for chunk_index, chunk in enumerate(article_state.get("chunks", []), start=1):
+            upload_items.append((article_id, chunk_index, Path(chunk["path"])))
 
+    if not upload_items:
+        return []
+
+    strategy = chunking_strategy(chunk_size, chunk_overlap)
+    print(
+        f"Uploading {len(upload_items)} delta chunks before batch attach "
+        f"(max_concurrency={max_concurrency}).",
+        flush=True,
+    )
+
+    uploaded_by_position: list[str | None] = [None] * len(upload_items)
     try:
-        for chunk_index, chunk in enumerate(chunks, start=1):
-            chunk_path = Path(chunk["path"])
-            print(
-                f"{prefix}Uploading chunk {chunk_index}/{len(chunks)} for {article_label}",
-                flush=True,
-            )
-            file_obj = None
-            try:
-                with chunk_path.open("rb") as stream:
-                    file_obj = client.files.create(file=stream, purpose="assistants")
-                vector_store_file = client.vector_stores.files.create_and_poll(
-                    file_obj.id,
-                    vector_store_id=vector_store_id,
-                    chunking_strategy=strategy,
+        with ThreadPoolExecutor(max_workers=max_concurrency) as executor:
+            futures = {
+                executor.submit(upload_chunk_file, client, chunk_path): index
+                for index, (_, _, chunk_path) in enumerate(upload_items)
+            }
+            for completed_count, future in enumerate(as_completed(futures), start=1):
+                index = futures[future]
+                article_id, chunk_index, _ = upload_items[index]
+                file_id = future.result()
+                uploaded_by_position[index] = file_id
+                print(
+                    f"[{completed_count}/{len(upload_items)}] Uploaded chunk "
+                    f"{chunk_index} for article {article_id}: {file_id}",
+                    flush=True,
                 )
-                ensure_vector_store_file_completed(vector_store_file, file_obj.id)
-            except Exception:
-                if file_obj is not None:
-                    delete_uploaded_file(client, vector_store_id, file_obj.id)
-                raise
-            file_ids.append(file_obj.id)
+
+        file_ids = [file_id for file_id in uploaded_by_position if file_id is not None]
+        print(f"Attaching {len(file_ids)} uploaded chunks as one OpenAI batch.", flush=True)
+        file_batch = client.vector_stores.file_batches.create_and_poll(
+            vector_store_id=vector_store_id,
+            file_ids=file_ids,
+            chunking_strategy=strategy,
+        )
+        ensure_file_batch_completed(file_batch, file_ids)
     except Exception:
-        for file_id in file_ids:
+        for file_id in [file_id for file_id in uploaded_by_position if file_id]:
             delete_uploaded_file(client, vector_store_id, file_id)
         raise
+
+    position = 0
+    for article_state in article_states:
+        chunk_count = len(article_state.get("chunks", []))
+        article_state["file_ids"] = file_ids[position : position + chunk_count]
+        position += chunk_count
 
     return file_ids
 
@@ -293,6 +332,7 @@ def run_sync(
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
     prepared_chunk_target: int = DEFAULT_PREPARED_CHUNK_TARGET,
+    max_concurrency: int = DEFAULT_UPLOAD_CONCURRENCY,
     dry_run: bool = False,
     client: OpenAI | None = None,
     store: LocalSyncStore | SpacesSyncStore | None = None,
@@ -384,18 +424,20 @@ def run_sync(
     }
 
     upload_article_ids = delta.added + delta.updated
-    for index, article_id in enumerate(upload_article_ids, start=1):
-        article_state = dict(current_articles[article_id])
-        article_state["file_ids"] = upload_article_chunks(
-            client,
-            synced_vector_store_id,
-            article_state,
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-            article_index=index,
-            article_total=len(upload_article_ids),
-        )
-        next_articles[article_id] = article_state
+    upload_article_states = [
+        dict(current_articles[article_id])
+        for article_id in upload_article_ids
+    ]
+    upload_article_chunks_batch(
+        client,
+        synced_vector_store_id,
+        upload_article_states,
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        max_concurrency=max_concurrency,
+    )
+    for article_state in upload_article_states:
+        next_articles[article_state["article_id"]] = article_state
 
     for article_id in delta.skipped:
         next_articles[article_id] = previous_articles[article_id]
@@ -459,6 +501,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE)
     parser.add_argument("--chunk-overlap", type=int, default=DEFAULT_CHUNK_OVERLAP)
     parser.add_argument("--prepared-chunk-target", type=int, default=DEFAULT_PREPARED_CHUNK_TARGET)
+    parser.add_argument("--max-concurrency", type=int, default=DEFAULT_UPLOAD_CONCURRENCY)
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
 
@@ -480,6 +523,7 @@ def main() -> int:
             chunk_size=args.chunk_size,
             chunk_overlap=args.chunk_overlap,
             prepared_chunk_target=args.prepared_chunk_target,
+            max_concurrency=args.max_concurrency,
             dry_run=args.dry_run,
         )
     except (RuntimeError, ValueError) as exc:
