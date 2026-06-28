@@ -28,6 +28,7 @@ from optibot_scraper.vector_store import (
     load_env_file,
     prepare_chunks,
 )
+from optibot_scraper.sync_storage import LocalSyncStore, SpacesSyncStore, sync_store_from_env
 
 
 DEFAULT_STATE_PATH = Path("data/job_state/sync_state.json")
@@ -152,6 +153,13 @@ def ensure_vector_store(
         metadata={"project": "optibot_takehome", "sync": "daily"},
     )
     return vector_store.id
+
+
+def optional_env(name: str) -> str | None:
+    value = os.environ.get(name)
+    if not value:
+        return None
+    return value
 
 
 def delete_uploaded_file(client: OpenAI, vector_store_id: str, file_id: str) -> bool:
@@ -287,6 +295,7 @@ def run_sync(
     prepared_chunk_target: int = DEFAULT_PREPARED_CHUNK_TARGET,
     dry_run: bool = False,
     client: OpenAI | None = None,
+    store: LocalSyncStore | SpacesSyncStore | None = None,
 ) -> dict[str, Any]:
     started_at = utc_now()
     if limit is not None and not dry_run:
@@ -294,6 +303,7 @@ def run_sync(
             "--limit is only allowed with --dry-run for sync jobs. "
             "A partial non-dry-run sync would treat omitted articles as deleted."
         )
+    store = store or sync_store_from_env(state_path, runs_dir)
 
     limit_label = f", limit={limit}" if limit is not None else ""
     print(f"Fetching articles from {base_url} ({locale}{limit_label})...", flush=True)
@@ -314,7 +324,7 @@ def run_sync(
         flush=True,
     )
 
-    previous_state = read_json(state_path, default={"articles": {}})
+    previous_state = store.read_state(default={"articles": {}})
     previous_articles = previous_state.get("articles", {})
     current_articles = build_current_articles_state(articles_dir, chunk_manifest)
     delta = classify_delta(previous_articles, current_articles)
@@ -322,7 +332,7 @@ def run_sync(
     existing_vector_store_id = (
         vector_store_id
         or previous_state.get("vector_store_id")
-        or os.environ.get("OPENAI_VECTOR_STORE_ID")
+        or optional_env("OPENAI_VECTOR_STORE_ID")
     )
 
     uploaded_chunks = sum(
@@ -350,7 +360,7 @@ def run_sync(
             deleted_chunks=planned_deleted_chunks,
             dry_run=True,
         )
-        write_run_artifacts(runs_dir, summary)
+        store.write_run_artifacts(summary)
         print(json.dumps(printable_summary(summary), indent=2, ensure_ascii=False))
         return summary
 
@@ -396,7 +406,7 @@ def run_sync(
         "article_count": len(next_articles),
         "articles": dict(sorted(next_articles.items())),
     }
-    write_json(state_path, next_state)
+    store.write_state(next_state)
 
     cleanup_failed_file_ids: list[str] = []
     actual_deleted_chunks = 0
@@ -418,7 +428,7 @@ def run_sync(
 
     if cleanup_failed_file_ids:
         next_state["cleanup_failed_file_ids"] = cleanup_failed_file_ids
-        write_json(state_path, next_state)
+        store.write_state(next_state)
 
     summary = build_run_summary(
         started_at,
@@ -430,7 +440,7 @@ def run_sync(
         failed=len(cleanup_failed_file_ids),
         cleanup_failed_file_ids=cleanup_failed_file_ids,
     )
-    write_run_artifacts(runs_dir, summary)
+    store.write_run_artifacts(summary)
     print(json.dumps(printable_summary(summary), indent=2, ensure_ascii=False))
     return summary
 
@@ -472,7 +482,7 @@ def main() -> int:
             prepared_chunk_target=args.prepared_chunk_target,
             dry_run=args.dry_run,
         )
-    except ValueError as exc:
+    except (RuntimeError, ValueError) as exc:
         print(exc)
         return 1
     return 0

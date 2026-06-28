@@ -11,6 +11,21 @@ from optibot_scraper.scraper import Article, FetchResult
 from optibot_scraper.sync_job import classify_delta, run_sync, write_json
 
 
+class MemorySyncStore:
+    def __init__(self):
+        self.state = None
+        self.run_artifacts = []
+
+    def read_state(self, default):
+        return json.loads(json.dumps(self.state if self.state is not None else default))
+
+    def write_state(self, payload):
+        self.state = json.loads(json.dumps(payload))
+
+    def write_run_artifacts(self, summary):
+        self.run_artifacts.append(json.loads(json.dumps(summary)))
+
+
 class MockVectorStoreFiles:
     def __init__(
         self,
@@ -407,6 +422,55 @@ class SyncJobTests(unittest.TestCase):
             self.assertNotIn("cleanup_failed_file_ids", retry_state)
             self.assertIn(("vector_delete", "file_stale"), retry_client.events)
             self.assertIn(("file_delete", "file_stale"), retry_client.events)
+
+    def test_run_sync_uses_persisted_store_state_across_runs(self):
+        article = Article(
+            article_id=1,
+            title="Article",
+            html_url="https://support.optisigns.com/hc/en-us/articles/1-Article",
+            updated_at="2026-01-01T00:00:00Z",
+            body="<h2>Setup</h2><p>Hello</p>",
+        )
+        store = MemorySyncStore()
+
+        with tempfile.TemporaryDirectory() as first_tmp:
+            first_root = Path(first_tmp)
+            with patch(
+                "optibot_scraper.sync_job.fetch_articles",
+                return_value=FetchResult([article], skipped_count=0),
+            ):
+                with redirect_stdout(io.StringIO()):
+                    first_summary = run_sync(
+                        articles_dir=first_root / "articles",
+                        chunks_dir=first_root / "chunks",
+                        state_path=first_root / "state" / "sync_state.json",
+                        runs_dir=first_root / "runs",
+                        client=MockOpenAIClient(),
+                        store=store,
+                    )
+
+        with tempfile.TemporaryDirectory() as second_tmp:
+            second_root = Path(second_tmp)
+            second_client = MockOpenAIClient()
+            with patch(
+                "optibot_scraper.sync_job.fetch_articles",
+                return_value=FetchResult([article], skipped_count=0),
+            ):
+                with redirect_stdout(io.StringIO()):
+                    second_summary = run_sync(
+                        articles_dir=second_root / "articles",
+                        chunks_dir=second_root / "chunks",
+                        state_path=second_root / "state" / "sync_state.json",
+                        runs_dir=second_root / "runs",
+                        client=second_client,
+                        store=store,
+                    )
+
+        self.assertEqual(first_summary["added"], 1)
+        self.assertEqual(second_summary["skipped"], 1)
+        self.assertEqual(second_summary["uploaded_chunks"], 0)
+        self.assertEqual(second_client.files.created, [])
+        self.assertEqual(len(store.run_artifacts), 2)
 
 
 if __name__ == "__main__":
