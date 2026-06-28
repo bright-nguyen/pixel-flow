@@ -1,0 +1,2 @@
+"""OptiBot scraper package."""
+

@@ -1,0 +1,5 @@
+beautifulsoup4>=4.12,<5
+markdownify>=0.13,<2
+openai>=2.0,<3
+requests>=2.32,<3
+tiktoken>=0.8,<1
