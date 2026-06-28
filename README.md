@@ -46,7 +46,13 @@ Follow the take-home instructions: [Quick sanity check](https://docs.google.com/
 - It should look like this:
 ![playground screenshot](screen-shot.png)
 
-- Daily job logs link:
+- Daily job artifacts:
+  - [First job artifact](https://sgp1.digitaloceanspaces.com/takehome28062026/optibot-job/job_runs/2026-06-28T070421-080893Z.json?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=DO00MHYRMZKUZUPAQWEW%2F20260628%2Fsgp1%2Fs3%2Faws4_request&X-Amz-Date=20260628T081331Z&X-Amz-Expires=604800&X-Amz-SignedHeaders=host&X-Amz-Signature=c81ab5ead64f5c1dbb35041a899e6cf96911c45ee710cabfbe5e0b9558cdd749): Scraped 402 articles and uploaded 713 chunks.
+  - [Latest job artifact](https://sgp1.digitaloceanspaces.com/takehome28062026/optibot-job/job_runs/latest.json?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=DO00MHYRMZKUZUPAQWEW%2F20260628%2Fsgp1%2Fs3%2Faws4_request&X-Amz-Date=20260628T080607Z&X-Amz-Expires=604800&X-Amz-SignedHeaders=host&X-Amz-Signature=ebfd55d863ac49fa21c9764245e1fa8888f3b8a0fa5d2519e3ee2e20384985fe): The run artifact shows the required job counts (`added`, `updated`, `skipped`, etc.).
+  - [Sync state](https://sgp1.digitaloceanspaces.com/takehome28062026/optibot-job/job_state/sync_state.json?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=DO00MHYRMZKUZUPAQWEW%2F20260628%2Fsgp1%2Fs3%2Faws4_request&X-Amz-Date=20260628T080252Z&X-Amz-Expires=604800&X-Amz-SignedHeaders=host&X-Amz-Signature=9da0fe770db917ad74d1cbdb39005bdfa08124fdf7b9d535e2e49e38bb4b07dd): The sync state is persisted separately and stores article hashes plus OpenAI file IDs so later runs can skip unchanged articles instead of re-uploading them.
+
+⚠️ Access links are temporary and expire at 2026-07-05 08:00 UTC.
+
 
 Run the scheduled-job flow locally without writing to OpenAI:
 
