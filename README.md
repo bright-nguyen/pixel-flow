@@ -31,7 +31,7 @@ python main.py prepare-chunks
 ```
 > ⚠️ For a faster local smoke test, scrape and chunk only 30 articles. But the Assistant can only retrieve answers from those 30 scraped articles, make sure scraped contain the articles you want to test.
 
-> Remove `--limit 30` to scrape full corpus of articles - this can take a while (~20 minutes for 402 articles).
+> Remove `--limit 30` to scrape full corpus of articles - this can take a while.
 
 **Upload the vector store to OpenAI**:
 
